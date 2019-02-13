@@ -1,0 +1,45 @@
+#!/bin/bash -u
+
+typeset -r OUT_TMP=out.tmp
+
+FAILURES=
+FAIL=
+
+TESTS=
+
+if (( $# > 0 ))
+then
+    TESTS="$@"
+else
+    TESTS=$(find tests -type f -print | sort)
+fi
+
+. ./functions
+init_all
+
+for FILE in $TESTS
+do
+    NAME=${FILE#tests/}
+    echo -n $NAME
+
+    /bin/bash -u $FILE > $OUT_TMP
+
+    if (( $? != 0 ))
+    then
+        FAILURES="$FAILURES $NAME"
+        echo " FAILED"
+        cat $OUT_TMP | sed 's@^@  @'
+    else
+        echo " OK"
+    fi
+done
+
+rm $OUT_TMP
+
+if [[ -n "$FAILURES" ]]
+then
+    echo
+    echo TESTS FAILED: $FAILURES
+fi
+
+cleanup_all

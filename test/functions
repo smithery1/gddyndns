@@ -1,0 +1,122 @@
+#!/bin/bash -u
+
+typeset -r APP=../gddyndns
+typeset -r CACHE_DIR=cache
+typeset -r STATUS_FILE=$CACHE_DIR/gddyndns.status
+typeset -r EXIT_CODE=$CACHE_DIR/exit
+
+SAVE_CACHE=
+
+function init_all
+{
+    true
+}
+
+function cleanup_all
+{
+    rm -rf "$CACHE_DIR"
+}
+
+function cleanup_cache
+{
+    rm -rf "$CACHE_DIR"
+    mkdir "$CACHE_DIR"
+}
+
+function do_run
+{
+    if [[ -z "$SAVE_CACHE" ]]
+    then
+        cleanup_cache
+    else
+        SAVE_CACHE=
+    fi
+
+    LAST_UPDATE_TIME=
+    LAST_UPDATE_STATUS=
+    LAST_UPDATE_TEXT=
+    UPDATE_LOCKOUT_TIME=
+    
+    OUTPUT=$("$APP" -c /dev/null -s "$CACHE_DIR" "$@" 2>&1; echo $? > $EXIT_CODE)
+    [[ -f "$STATUS_FILE" ]] && . "$STATUS_FILE"
+
+    return $(cat $EXIT_CODE)
+}
+
+function check_output
+{
+    local TEST=$1
+    local EXPECTED=$2
+    local OUTPUT=$3
+
+    if [[ "$EXPECTED" != "$OUTPUT" ]]
+    then
+        echo "$TEST FAILED: [$EXPECTED] != [$OUTPUT]"
+        exit 1
+    fi
+}
+
+function check_output_regex
+{
+    local TEST=$1
+    local EXPECTED=$2
+    local OUTPUT=$3
+
+    if [[ ! "$OUTPUT" =~ $EXPECTED ]]
+    then
+        echo "$TEST FAILED: [$EXPECTED] != [$OUTPUT]"
+        exit 1
+    fi
+}
+
+function run_ok
+{
+    local TEST=$1
+    local EXPECTED=$2
+    shift 2
+
+    if ! do_run "$@"
+    then
+        echo "$TEST FAILED: expected 0 exit status but got $(cat $EXIT_CODE)"
+        echo Output: $OUTPUT
+        exit 1
+    fi
+}
+
+function run_err
+{
+    local TEST=$1
+    local EXPECTED=$2
+    shift 2
+
+    if do_run "$@"
+    then
+        echo "$TEST FAILED: expected non-zero exit status but got 0"
+        echo "Output: $OUTPUT"
+        exit 1
+    fi
+}
+
+function assert_ok
+{
+    run_ok "$@"
+    check_output "$1" "$2" "$OUTPUT"
+}
+
+function assert_ok_regex
+{
+    run_ok "$@"
+    check_output_regex "$1" "$2" "$OUTPUT"
+}
+
+function assert_err
+{
+    run_err "$@"
+    check_output "$1" "$2" "$OUTPUT"
+}
+
+function assert_err_regex
+{
+    run_err "$@"
+    check_output_regex "$1" "$2" "$OUTPUT"
+}

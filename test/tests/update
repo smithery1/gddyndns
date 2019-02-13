@@ -1,0 +1,87 @@
+#!/bin/bash -u
+
+. ./functions
+
+function assert_status
+{
+    local S=$1
+    local F=$2
+    shift 2
+
+    $F "$@"
+
+    if [[ "$LAST_UPDATE_STATUS" != "$S" ]]
+    then
+        echo "$1 FAILED: LAST_UPDATE_STATUS [$LAST_UPDATE_STATUS] != [$S]"
+        exit 1
+    fi
+
+    if [[ "$LAST_UPDATE_TEXT" != "$2" ]]
+    then
+        echo "$1 FAILED: LAST_UPDATE_TEXT [$LAST_UPDATE_TEXT] != [$2]"
+        exit 1
+    fi
+}
+
+function assert_lockout
+{
+    local LOCKOUT_TIME="$1"
+    shift
+
+    assert_status lockout "$@"
+
+    local D
+    let D=$(( $UPDATE_LOCKOUT_TIME - $LAST_UPDATE_TIME ))
+
+    if (( $LOCKOUT_TIME != $D ))
+    then
+        echo "$1 FAILED: Lockout time $LOCKOUT_TIME != $D"
+        exit 1
+    fi
+}
+
+# Input: Arguments without values
+# Output: Error message
+assert_err arg1 "Missing arg for -d" update --test test -d
+assert_err arg2 "Missing arg for --domain" update --test test --domain
+assert_err arg3 "Missing arg for -l" update --test test -l
+assert_err arg4 "Missing arg for --lockout" update --test test --lockout
+assert_err arg5 "Missing arg for -p" update --test test -p
+assert_err arg6 "Missing arg for --pass" update --test test --pass
+assert_err arg7 "Missing arg for -u" update --test test -u
+assert_err arg8 "Missing arg for --user" update --test test --user
+assert_err arg9 "Missing arg for -t" update --test test -t
+assert_err arg10 "Missing arg for --test" update --test test --test
+
+# Input: Unknown domain
+# Output: Error message
+assert_err unknownDomain1 "Cannot get IP address for nodomain.local []" update --test test -d nodomain.local
+
+# Input: Invalid lockout time
+# Output: Error message
+assert_err unknownDomain1 "Invalid lockout time abc" update --test test -l abc
+assert_err unknownDomain1 "Invalid lockout time abc" update --test test -l abc
+
+# Test unchanged
+# Output: Success message
+assert_status ok assert_ok unchanged1 "IP address 192.168.1.1 for test.local unchanged" update --test DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.1 -d test.local
+
+# Test update ok
+# Output: Success message
+assert_status ok assert_ok ok1 "Changed from 192.168.1.1 to 192.168.1.2 for test.local" update --test "DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.2,RESULT=good 192.168.1.2" -d test.local
+assert_status ok assert_ok ok2 "Attempted change but already set to 192.168.1.2 for test.local" update --test "DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.2,RESULT=nochg 192.168.1.2" -d test.local
+
+# Test lockout default time
+# Output: Fail message
+assert_lockout 86400 assert_err lockout_def1 "Change failed from 192.168.1.1 to 192.168.1.2 for test.local: nohost" update --test "DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.2,RESULT=nohost" -d test.local
+SAVE_CACHE=1
+assert_err_regex lockout2 "^Previous run failed to update" update --test "DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.2,RESULT=nohost" -d test.local
+
+# Test lockout times
+# Output: Fail message
+assert_lockout 900 assert_err lockout_time1 "Change failed from 192.168.1.1 to 192.168.1.2 for test.local: nohost" update --test "DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.2,RESULT=nohost" -d test.local -l 15m
+assert_lockout 3600 assert_err lockout_time2 "Change failed from 192.168.1.1 to 192.168.1.2 for test.local: nohost" update --test "DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.2,RESULT=nohost" -d test.local -l 1h
+
+# Test 911 lockout
+# Output: Fail message
+assert_lockout 300 assert_err lockout911 "Change failed from 192.168.1.1 to 192.168.1.2 for test.local: 911" update --test "DOMAIN_IP=192.168.1.1,ISP_IP=192.168.1.2,RESULT=911" -d test.local

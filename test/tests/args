@@ -1,0 +1,51 @@
+#!/bin/bash -u
+
+. ./functions
+typeset -r CONFIG="$CACHE_DIR/config"
+
+function create_config
+{
+    cleanup_cache
+    cat << EOF > "$CONFIG"
+USER=user123
+PASS=pass123
+DOMAIN=test123.local
+CACHE_DIR=/tmp
+EOF
+}
+
+# Input: Unknown global arg
+# Output: Error message
+assert_err global1 "Unknown global arg -x" -x
+assert_err global2 "Unknown global arg --x" --x
+
+# Input: Invalid command
+# Output: Error message
+assert_err invalid1 "Unknown global arg xyz" xyz
+assert_err invalid2 "Unknown global arg xyz" xyz abc
+
+# Input: -c argument that does not exist
+# Output: Error message
+assert_err config1 "Config file nonexistent does not exist" -c nonexistent update --test test
+assert_err config2 "Config file nonexistent does not exist" --config nonexistent update --test test
+
+# Input: -s argument that does not exist
+# Output: Error message
+assert_err dir1 "Cache dir nonexistent does not exist" -c /dev/null -s nonexistent update --test test
+assert_err dir2 "Cache dir nonexistent does not exist" -c /dev/null --cache nonexistent update --test test
+
+# Input: -h argument
+# Output: Help
+assert_err_regex help1 "^Usage: .*" -h
+assert_err_regex help2 "^Usage: .*" --help
+
+# Input: No cache file
+# Output: Status success
+assert_ok_regex nocache ".*" -c /dev/null status
+
+# Check overrides of config file
+# Input: Command line overrides
+# Output: Status success
+SAVE_CACHE=1
+create_config
+assert_ok_regex override1 "  *CACHE_DIR: *$CACHE_DIR" -c "$CONFIG" -s "$CACHE_DIR" status

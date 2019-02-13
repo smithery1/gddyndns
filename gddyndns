@@ -1,0 +1,520 @@
+#!/bin/bash -u
+
+typeset -r NAME=gddyndns
+typeset -r DEFAULT_CONFIG_FILE=$HOME/.$NAME
+typeset -r DEFAULT_CACHE_DIR=$PWD
+typeset -r DEFAULT_LOCKOUT_TIME=24h
+typeset -r DEFAULT_LOCKOUT_TIME_911=5m
+
+function usage_and_exit
+{
+    local ERR=${1:-''}
+
+    if [[ -n "$USE_LOGGER" ]]
+    then
+        [[ -n "$ERR" ]] && log_error "$ERR"
+    else
+        cat << EOF
+Usage: $PROG [<args>] <command> [<command args>]
+  -h|--help           This message
+  -c|--config <file>  Read settings from here
+                      Defaults to \$HOME/.$NAME
+  -s|--cache <dir>    The directory in which to cache status files
+                      Defaults to the runtime directory
+
+Commands are:
+  help                This message
+  status              Status of gddyndns
+  update
+    -d|--domain <fqdn>        The domain name
+    -l|--lockout <time><unit> Lockout time
+                              <unit> is m (minutes) or h (hours)
+    -p|--pass <passwd>        The Google Dynamic DNS record password
+    -u|--user <user id>       The Google Dynamic DNS record user id
+    -t|--test <params>        Do not update the IP address for testing
+                              Argument is parms of the form
+                                <field>=<value>[,...]
+                              <field> is one of:
+                                DOMAIN_IP, ISP_IP, RESULT, RESULT_ERR
+
+Some settings may also be placed in the config file.
+Command line settings take precedence over the config file values.
+CACHE_DIR=<dir>
+DOMAIN=<doman name>
+LOCKOUT=<time><unit>
+AUTH_PASS=<password>
+AUTH_USER=<user id>
+EOF
+    fi
+    exit 1
+}
+
+function unknown_arg
+{
+    fail "Unknown $1 arg $2"
+}
+
+function missing_arg
+{
+    fail "Missing arg for $1"
+}
+
+function log
+{
+    local SEV=$1
+    shift
+
+    if [[ -n "$USE_LOGGER" ]]
+    then
+        logger -t "$NAME" -p "daemon.$SEV" -- "$@"
+    else
+        echo "$@"
+    fi
+}
+
+function log_file
+{
+    local SEV=$1
+    shift
+
+    if [[ -s "$1" ]]
+    then
+        if [[ -n "$USE_LOGGER" ]]
+        then
+            logger -t "$NAME" -p "daemon.$SEV" -f "$1"
+        else
+            cat $1
+        fi
+    fi
+}
+
+function log_info
+{
+    log info "$1"
+}
+
+function log_error
+{
+    log error "$1"
+    (( $# > 1 )) && log_file error "$2"
+}
+
+function fail
+{
+    log_error "$@"
+    exit 1
+}
+
+function format_time
+{
+    local TIME="$1"
+
+    if [[ "$TIME" =~ [0-9]+ ]]
+    then
+        date -d "@$TIME" --rfc-3339=seconds
+    else
+        echo "$@"
+    fi
+}
+
+function get_domain_ip
+{
+    local DOMAIN=$1
+    dig -q "$DOMAIN" A | awk '{ if ($1 == "'$DOMAIN'." && $4 == "A") print $5 }' 2> "$ERR_FILE"
+}
+
+function get_isp_ip
+{
+    wget -O "$OUT_FILE" https://domains.google.com/checkip > "$ERR_FILE" 2>&1
+    cat "$OUT_FILE"
+}
+
+function check_ip
+{
+    [[ "$1" =~ [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3} ]] && return 0
+    return 1
+}
+
+function read_status
+{
+    LAST_UPDATE_TIME=never
+    LAST_UPDATE_STATUS=none
+    LAST_UPDATE_TEXT=
+    UPDATE_LOCKOUT_TIME=none
+
+    if [[ -f "$STATUS_FILE" ]]
+    then
+        . "$STATUS_FILE" 2> "$ERR_FILE" || return 1
+    fi
+
+    return 0
+}
+
+function write_status
+{
+    cat << EOF > "$STATUS_FILE" 2> "$ERR_FILE"
+LAST_UPDATE_TIME="$UPDATE_TIME"
+LAST_UPDATE_STATUS="$LAST_UPDATE_STATUS"
+LAST_UPDATE_TEXT="$LAST_UPDATE_TEXT"
+UPDATE_LOCKOUT_TIME="$UPDATE_LOCKOUT_TIME"
+EOF
+}
+
+function parse_help
+{
+    true
+}
+
+function run_help
+{
+    usage_and_exit
+}
+
+function parse_status
+{
+    while (( $# > 0 ))
+    do
+        case "$1" in
+        *)
+            unknown_arg status "$1"
+            ;;
+        esac
+
+        shift
+    done
+}
+
+function run_status
+{
+    if read_status
+    then
+        cat << EOF
+Last update check:    $(format_time $LAST_UPDATE_TIME)
+Last update status:   $LAST_UPDATE_STATUS
+Last update text:     $LAST_UPDATE_TEXT
+Update lockout until: $(format_time $UPDATE_LOCKOUT_TIME)
+Config file:          $CONFIG_FILE
+  CACHE_DIR:          $CACHE_DIR
+  DOMAIN:             ${DOMAIN:-}
+  AUTH_USER:          ${AUTH_USER:-}
+  AUTH_PASS:          ${AUTH_PASS:-}
+  LOCKOUT_TIME:       ${LOCKOUT_TIME:-}
+EOF
+    fi
+
+    local IPS_OK=1
+    local DOMAIN_IP ISP_IP
+
+    if [[ -n "${DOMAIN:-}" ]]
+    then
+        echo -n "IP for domain:        "
+        DOMAIN_IP=$(get_domain_ip "$DOMAIN")
+
+        if check_ip "$DOMAIN_IP"
+        then
+            echo $DOMAIN_IP
+        else
+            IPS_OK=
+            echo "failed [$DOMAIN_IP]"
+            [[ -s "$ERR_FILE" ]] && cat $ERR_FILE | sed 's@^@  @'
+        fi
+    else
+        IPS_OK=
+    fi
+
+    echo -n "IP from ISP:          "
+    ISP_IP=$(get_isp_ip)
+
+    if check_ip "$ISP_IP"
+    then
+        echo $ISP_IP
+    else
+        IPS_OK=
+        echo failed [$ISP_IP]
+        [[ -s "$ERR_FILE" ]] && cat $ERR_FILE | sed 's@^@  @'
+    fi
+
+    if [[ -n "$IPS_OK" ]]
+    then
+        if [[ "$DOMAIN_IP" == "$ISP_IP" ]]
+        then
+            echo "No update needed"
+        else
+            echo "Update needed"
+        fi
+    fi
+}
+
+function get_test
+{
+    local TEST="$1"
+    local REQ_FIELD="$2"
+    local FIELD
+
+    local ORIG_IFS=$IFS
+    IFS=,
+    set $TEST
+    IFS=$ORIG_IFS
+
+    while (( $# > 0 ))
+    do
+        FIELD=${1%%=*}
+        VALUE=${1#*=}
+
+        if [[ "$FIELD" == "$REQ_FIELD" ]]
+        then
+            echo ${1#*=}
+            return 0
+        fi
+
+        shift
+    done
+
+    return 1
+}
+
+function parse_time
+{
+    local INPUT=$1
+    local TIME
+    local UNIT
+    local OUTPUT
+
+    if [[ "$INPUT" =~ [0-9]+[mh] ]]
+    then
+        UNIT=${INPUT##*[0-9]}
+        TIME=${INPUT%[mh]}
+
+        case "$UNIT" in
+        m)
+            OUTPUT=$(( $TIME * 60 ))
+            ;;
+        h)
+            OUTPUT=$(( $TIME * 60 * 60 ))
+            ;;
+        esac
+
+        echo $OUTPUT
+    fi
+}
+
+function parse_update
+{
+    TEST=
+
+    while (( $# > 0 ))
+    do
+        case "$1" in
+        -d|--domain)
+            (( $# == 1 )) && missing_arg "$1"
+            DOMAIN="$2"
+            shift
+            ;;
+        -u|--user)
+            (( $# == 1 )) && missing_arg "$1"
+            AUTH_USER="$2"
+            shift
+            ;;
+        -p|--pass)
+            (( $# == 1 )) && missing_arg "$1"
+            AUTH_PASS="$2"
+            shift
+            ;;
+        -l|--lockout)
+            (( $# == 1 )) && missing_arg "$1"
+            LOCKOUT_TIME="$2"
+            shift
+            ;;
+        -t|--test)
+            (( $# == 1 )) && missing_arg "$1"
+            TEST="$2"
+            shift
+            ;;
+        *)
+            unknown_arg update "$1"
+            ;;
+        esac
+
+        shift
+    done
+
+    local PARSED=$(parse_time $LOCKOUT_TIME)
+    [[ -z "$PARSED" ]] && fail "Invalid lockout time $LOCKOUT_TIME"
+    LOCKOUT_TIME="$PARSED"
+
+    [[ -z "${DOMAIN:-''}" ]] && fail "DOMAIN is required"
+    [[ -z "${AUTH_USER:-''}" ]] && fail "AUTH_USER is required"
+    [[ -z "${AUTH_PASS:-''}" ]] && fail "AUTH_PASS is required"
+}
+
+function run_update
+{
+    touch "$STATUS_FILE" || fail "Cannot write to $STATUS_FILE"
+    touch "$OUT_FILE" || fail "Cannot write to $OUT_FILE"
+    touch "$ERR_FILE" || fail "Cannot write to $ERR_FILE"
+
+    type -p awk >/dev/null || fail "Cannot find awk on path $PATH"
+    type -p dig >/dev/null || fail "Cannot find dig on path $PATH"
+    type -p wget >/dev/null || fail "Cannot find wget on path $PATH"
+
+    read_status || fail "Cannot read $STATUS_FILE" "$ERR_FILE"
+
+    UPDATE_TIME=$(date +%s)
+
+    if [[ "$LAST_UPDATE_STATUS" == "lockout" ]] && (( $UPDATE_TIME < $UPDATE_LOCKOUT_TIME ))
+    then
+        write_status
+        log_error "Previous run failed to update. Waiting until $(format_time $UPDATE_LOCKOUT_TIME) to try again."
+        return 1
+    fi
+
+    local DOMAIN_IP=
+    [[ -n "$TEST" ]] && DOMAIN_IP=$(get_test "$TEST" DOMAIN_IP)
+    [[ -z "$DOMAIN_IP" ]] && DOMAIN_IP=$(get_domain_ip "$DOMAIN")
+
+    if ! check_ip "$DOMAIN_IP"
+    then
+        LAST_UPDATE_TEXT="Cannot get IP address for $DOMAIN [$DOMAIN_IP]"
+        LAST_UPDATE_STATUS=fail
+        write_status
+        log_error "$LAST_UPDATE_TEXT" "$ERR_FILE"
+        return 1
+    fi
+
+    local ISP_IP=
+    [[ -n "$TEST" ]] && ISP_IP=$(get_test "$TEST" ISP_IP)
+    [[ -z "$ISP_IP" ]] && ISP_IP=$(get_isp_ip)
+
+    if ! check_ip "$ISP_IP"
+    then
+        LAST_UPDATE_TEXT="Cannot get ISP IP address [$ISP_IP]"
+        LAST_UPDATE_STATUS=fail
+        write_status
+        log_error "$LAST_UPDATE_TEXT" "$ERR_FILE"
+        return 1
+    fi
+
+    local RETURN=0
+    local RESULT=
+    local RESULT_ERR=
+
+    if [[ "$DOMAIN_IP" == "$ISP_IP" ]]
+    then
+        LAST_UPDATE_TEXT="IP address $DOMAIN_IP for $DOMAIN unchanged"
+        LAST_UPDATE_STATUS=ok
+    else
+        if [[ -n "$TEST" ]]
+        then
+            RESULT=$(get_test "$TEST" RESULT)
+            RESULT_ERR=$(get_test "$TEST" RESULT_ERR)
+            echo "$RESULT_ERR" > "$ERR_FILE"
+        else
+            wget -q -O "$OUT_FILE" "https://${AUTH_USER}:${AUTH_PASS}@domains.google.com/nic/update?hostname=$DOMAIN&myip=$ISP_IP" > "$ERR_FILE" 2>&1
+            RESULT=$(cat $OUT_FILE)
+        fi
+
+        if [[ "$RESULT" == "good $ISP_IP" ]]
+        then
+            LAST_UPDATE_TEXT="Changed from $DOMAIN_IP to $ISP_IP for $DOMAIN"
+            LAST_UPDATE_STATUS=ok
+        elif [[ "$RESULT" == "nochg $ISP_IP" ]]
+        then
+            LAST_UPDATE_TEXT="Attempted change but already set to $ISP_IP for $DOMAIN"
+            LAST_UPDATE_STATUS=ok
+        else
+            [[ "$RESULT" == 911 ]] && LOCKOUT_TIME=$(parse_time $DEFAULT_LOCKOUT_TIME_911)
+            LAST_UPDATE_TEXT="Change failed from $DOMAIN_IP to $ISP_IP for $DOMAIN: $RESULT"
+            LAST_UPDATE_STATUS=lockout
+            UPDATE_LOCKOUT_TIME=$(( $UPDATE_TIME + $LOCKOUT_TIME ))
+            RETURN=1
+        fi
+    fi
+
+    write_status
+
+    if (( $RETURN == 0 ))
+    then
+        log_info "$LAST_UPDATE_TEXT"
+    else
+        log_error "$LAST_UPDATE_TEXT" "$ERR_FILE"
+    fi
+
+    return $RETURN
+}
+
+export PATH=/bin:/usr/bin:/sbin:/usr/sbin
+PROG=${0##*/}
+
+CONFIG_FILE=
+CACHE_DIR="$DEFAULT_CACHE_DIR"
+COMMAND=
+TEST=
+USE_LOGGER=
+
+while (( $# > 0 ))
+do
+    case "$1" in
+    -h|--help)
+        usage_and_exit help
+        ;;
+    -c|--config)
+        (( $# == 1 )) && missing_arg "$1"
+        CONFIG_FILE="$2"
+        shift
+        ;;
+    -s|--cache)
+        (( $# == 1 )) && missing_arg "$1"
+        CMD_CACHE_DIR="$2"
+        shift
+        ;;
+    *)
+        COMMAND="$1"
+        if [[ $(type -t "parse_$COMMAND") == "function" ]]
+        then
+            shift
+            break
+        else
+            unknown_arg global "$1"
+        fi
+        ;;
+    esac
+
+    shift
+done
+
+[[ -z "$COMMAND" ]] && fail "Command required, $PROG help for help"
+
+if [[ -z "$CONFIG_FILE" ]]
+then
+    CONFIG_FILE=$DEFAULT_CONFIG_FILE
+    if [[ -f "$CONFIG_FILE" ]]
+    then
+        . "$CONFIG_FILE" || fail "Cannot read $CONFIG_FILE"
+    fi
+elif [[ -r "$CONFIG_FILE" ]]
+then
+    . "$CONFIG_FILE" || fail "Cannot read $CONFIG_FILE"
+else
+    fail "Config file $CONFIG_FILE does not exist"
+fi
+
+[[ -n "${CMD_CACHE_DIR:-}" ]] && CACHE_DIR=$CMD_CACHE_DIR
+[[ -z "${LOCKOUT_TIME:-}" ]] && LOCKOUT_TIME=$DEFAULT_LOCKOUT_TIME
+
+parse_$COMMAND "$@"
+
+if [[ -z "$TEST" && ( ! -t 1 || ! -t 2 ) ]]
+then
+    type -p logger > /dev/null && USE_LOGGER=1
+fi
+
+STATUS_FILE=$CACHE_DIR/$NAME.status
+OUT_FILE=$CACHE_DIR/$NAME.out
+ERR_FILE=$CACHE_DIR/$NAME.err
+
+[[ -z "$CACHE_DIR" ]] && fail "Cache dir $CACHE_DIR not set"
+[[ -d "$CACHE_DIR" ]] || fail "Cache dir $CACHE_DIR does not exist"
+
+trap  'rm -f "$OUT_FILE" "$ERR_FILE"' 0
+
+run_$COMMAND
